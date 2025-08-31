@@ -36,6 +36,8 @@ load_dotenv()
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8080"))
 STATE_DB = os.getenv("STATE_DB", "./state.db")
+USER_CONFIG_FILE = os.getenv("USER_CONFIG_FILE", "./users.json")
+users_cache = None
 
 # ---- App & static ----
 app = FastAPI(title="Immich Drop Uploader (Python)")
@@ -55,6 +57,32 @@ SETTINGS: Settings = load_settings()
 
 # Album cache
 ALBUM_ID: Optional[str] = None
+
+
+def load_users_config():
+    """Carrega configuração dos usuários do arquivo JSON."""
+    global users_cache
+    if users_cache is None:
+        try:
+            with open(USER_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                users_cache = json.load(f)
+        except Exception as e:
+            print(f"Erro ao carregar users.json: {e}")
+            users_cache = {"users": []}
+    return users_cache
+
+def get_user_api_key(user_id: str) -> Optional[str]:
+    """Retorna a API key para um usuário específico."""
+    config = load_users_config()
+    for user in config.get("users", []):
+        if user["id"] == user_id:
+            return user["api_key"]
+    return None
+
+def immich_headers_for_user(user_id: str) -> dict:
+    """Headers para chamadas da API do Immich para um usuário específico."""
+    api_key = get_user_api_key(user_id) or SETTINGS.immich_api_key
+    return {"Accept": "application/json", "x-api-key": api_key}
 
 # ---------- DB (local dedupe cache) ----------
 
@@ -304,6 +332,31 @@ async def send_progress(session_id: str, item_id: str, status: str, progress: in
         "responseId": response_id,
     })
 
+def add_asset_to_specific_album(asset_id: str, album_id: str, user_id: str) -> bool:
+    """Adiciona um asset a um álbum específico."""
+    if not album_id or not asset_id:
+        return False
+    
+    try:
+        url = f"{SETTINGS.normalized_base_url}/albums/{album_id}/assets"
+        payload = {"ids": [asset_id]}
+        r = requests.put(
+            url, 
+            headers={**immich_headers_for_user(user_id), "Content-Type": "application/json"}, 
+            json=payload, 
+            timeout=10
+        )
+        
+        if r.status_code == 200:
+            results = r.json()
+            for result in results:
+                if result.get("success") or result.get("error") == "duplicate":
+                    return True
+        return False
+    except Exception as e:
+        print(f"Erro ao adicionar asset ao álbum: {e}")
+        return False
+        
 # ---------- Routes ----------
 
 @app.get("/", response_class=HTMLResponse)
@@ -354,6 +407,8 @@ async def api_upload(
     item_id: str = Form(...),
     session_id: str = Form(...),
     last_modified: Optional[int] = Form(None),
+    user_id: Optional[str] = Form(None),  # NOVO
+    album_id: Optional[str] = Form(None),  # NOVO
 ):
     """Receive a file, check duplicates, forward to Immich; stream progress via WS."""
     raw = await file.read()
@@ -406,7 +461,9 @@ async def api_upload(
                     sent["pct"] = pct
                     asyncio.create_task(send_progress(session_id, item_id, "uploading", pct))
         monitor = MultipartEncoderMonitor(encoder, cb)
-        headers = {"Accept": "application/json", "Content-Type": monitor.content_type, "x-immich-checksum": checksum, **immich_headers()}
+        #headers = {"Accept": "application/json", "Content-Type": monitor.content_type, "x-immich-checksum": checksum, **immich_headers()}
+        api_headers = immich_headers_for_user(user_id) if user_id else immich_headers()
+        headers = {"Accept": "application/json", "Content-Type": monitor.content_type, "x-immich-checksum": checksum, **api_headers}
         try:
             r = requests.post(f"{SETTINGS.normalized_base_url}/assets", headers=headers, data=monitor, timeout=120)
             if r.status_code in (200, 201):
@@ -416,10 +473,18 @@ async def api_upload(
                 status = data.get("status", "created")
                 
                 # Add to album if configured
-                if SETTINGS.album_name and asset_id:
+                # if SETTINGS.album_name and asset_id:
+                #     if add_asset_to_album(asset_id):
+                #         status += f" (added to album '{SETTINGS.album_name}')"
+                
+                # Add to album if specified
+                if album_id and asset_id:
+                    if add_asset_to_specific_album(asset_id, album_id, user_id):
+                        status += f" (adicionado ao álbum)"
+                elif SETTINGS.album_name and asset_id:
                     if add_asset_to_album(asset_id):
                         status += f" (added to album '{SETTINGS.album_name}')"
-                
+
                 await send_progress(session_id, item_id, "duplicate" if status == "duplicate" else "done", 100, status, asset_id)
                 return JSONResponse({"id": asset_id, "status": status}, status_code=200)
             else:
@@ -434,6 +499,75 @@ async def api_upload(
             return JSONResponse({"error": str(e)}, status_code=500)
 
     return await do_upload()
+
+@app.get("/api/users")
+async def api_users() -> dict:
+    """Retorna lista de usuários disponíveis."""
+    config = load_users_config()
+    users = []
+    for user in config.get("users", []):
+        users.append({
+            "id": user["id"],
+            "name": user["name"],
+            "email": user["email"]
+        })
+    return {"users": users}
+
+@app.get("/api/albums")
+async def api_albums(userId: Optional[str] = None) -> dict:
+    """Retorna álbuns do usuário especificado."""
+    if not userId:
+        return {"error": "userId é obrigatório"}, 400
+    
+    try:
+        url = f"{SETTINGS.normalized_base_url}/albums"
+        r = requests.get(url, headers=immich_headers_for_user(userId), timeout=10)
+        
+        if r.status_code == 200:
+            albums = r.json()
+            return {"albums": albums}
+        else:
+            return {"error": f"Erro ao buscar álbuns: {r.status_code}"}, 400
+    except Exception as e:
+        return {"error": f"Erro ao conectar com Immich: {str(e)}"}, 500
+
+@app.post("/api/albums")
+async def api_create_album(request: Request) -> dict:
+    """Cria um novo álbum para o usuário especificado."""
+    try:
+        data = await request.json()
+        user_id = data.get("userId")
+        album_name = data.get("albumName")
+        
+        if not user_id or not album_name:
+            return JSONResponse({"error": "userId e albumName são obrigatórios"}, status_code=400)
+        
+        url = f"{SETTINGS.normalized_base_url}/albums"
+        payload = {
+            "albumName": album_name,
+            "description": f"Criado via Immich Drop para {user_id}"
+        }
+        
+        r = requests.post(
+            url, 
+            headers={**immich_headers_for_user(user_id), "Content-Type": "application/json"}, 
+            json=payload, 
+            timeout=10
+        )
+        
+        if r.status_code in (200, 201):
+            album = r.json()
+            return {"album": album}
+        else:
+            error_msg = r.text
+            try:
+                error_data = r.json()
+                error_msg = error_data.get("message", error_msg)
+            except:
+                pass
+            return JSONResponse({"error": f"Erro ao criar álbum: {error_msg}"}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": f"Erro interno: {str(e)}"}, status_code=500)
 
 """
 Note: Do not run this module directly. Use `python main.py` from

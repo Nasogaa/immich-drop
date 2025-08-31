@@ -2,6 +2,8 @@
 const sessionId = (crypto && crypto.randomUUID) ? crypto.randomUUID() : (Math.random().toString(36).slice(2));
 let items = [];
 let socket;
+let users = [];
+let albums = [];
 
 // Status precedence: never regress (e.g., uploading -> done shouldn't go back to uploading)
 const STATUS_ORDER = { queued: 0, checking: 1, uploading: 2, duplicate: 3, done: 3, error: 4 };
@@ -30,6 +32,107 @@ function updateThemeIcon() {
 
 initDarkMode();
 
+// --- User and Album Management ---
+async function loadUsers() {
+  try {
+    const response = await fetch('/api/users');
+    if (!response.ok) throw new Error('Failed to load users');
+    
+    const data = await response.json();
+    users = data.users || [];
+    
+    const userSelect = document.getElementById('userSelect');
+    userSelect.innerHTML = '<option value="">Selecione um usuário</option>';
+    
+    users.forEach(user => {
+      const option = document.createElement('option');
+      option.value = user.id;
+      option.textContent = user.name || user.email;
+      userSelect.appendChild(option);
+    });
+    
+    // Auto-select first user if only one exists
+    if (users.length === 1) {
+      userSelect.value = users[0].id;
+      await loadAlbums(users[0].id);
+    }
+  } catch (error) {
+    console.error('Error loading users:', error);
+    document.getElementById('userSelect').innerHTML = '<option value="">Erro ao carregar usuários</option>';
+  }
+}
+
+async function loadAlbums(userId) {
+  if (!userId) {
+    const albumSelect = document.getElementById('albumSelect');
+    albumSelect.innerHTML = '<option value="">Selecione um usuário primeiro</option>';
+    return;
+  }
+  
+  try {
+    const response = await fetch(`/api/albums?userId=${userId}`);
+    if (!response.ok) throw new Error('Failed to load albums');
+    
+    const data = await response.json();
+    albums = data.albums || [];
+    
+    const albumSelect = document.getElementById('albumSelect');
+    albumSelect.innerHTML = '<option value="">Criar novo álbum</option>';
+    
+    albums.forEach(album => {
+      const option = document.createElement('option');
+      option.value = album.id;
+      option.textContent = album.albumName;
+      albumSelect.appendChild(option);
+    });
+  } catch (error) {
+    console.error('Error loading albums:', error);
+    document.getElementById('albumSelect').innerHTML = '<option value="">Erro ao carregar álbuns</option>';
+  }
+}
+
+async function createAlbum(userId, albumName) {
+  try {
+    const response = await fetch('/api/albums', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        userId: userId,
+        albumName: albumName
+      })
+    });
+    
+    if (!response.ok) throw new Error('Failed to create album');
+    
+    const data = await response.json();
+    await loadAlbums(userId); // Reload albums
+    
+    // Select the newly created album
+    document.getElementById('albumSelect').value = data.album.id;
+    
+    showBanner(`Álbum "${albumName}" criado com sucesso!`, 'ok');
+    return data.album;
+  } catch (error) {
+    console.error('Error creating album:', error);
+    showBanner('Erro ao criar álbum', 'error');
+    throw error;
+  }
+}
+
+function getSelectedUserAndAlbum() {
+  const userId = document.getElementById('userSelect').value;
+  const albumId = document.getElementById('albumSelect').value;
+  
+  if (!userId) {
+    showBanner('Por favor, selecione um usuário', 'warn');
+    return null;
+  }
+  
+  return { userId, albumId };
+}
+
 // --- helpers ---
 function human(bytes){
   if (!bytes) return '0 B';
@@ -39,8 +142,20 @@ function human(bytes){
 }
 
 function addItem(file){
+  const selection = getSelectedUserAndAlbum();
+  if (!selection) return;
+  
   const id = (crypto && crypto.randomUUID) ? crypto.randomUUID() : (Math.random().toString(36).slice(2));
-  const it = { id, file, name: file.name, size: file.size, status: 'queued', progress: 0 };
+  const it = { 
+    id, 
+    file, 
+    name: file.name, 
+    size: file.size, 
+    status: 'queued', 
+    progress: 0,
+    userId: selection.userId,
+    albumId: selection.albumId
+  };
   items.unshift(it);
   render();
 }
@@ -62,7 +177,7 @@ function render(){
         <div class="h-full ${it.status==='done'?'bg-green-500':it.status==='duplicate'?'bg-amber-500':it.status==='error'?'bg-red-500':'bg-blue-500'}" style="width:${Math.max(it.progress, (it.status==='done'||it.status==='duplicate'||it.status==='error')?100:it.progress)}%"></div>
       </div>
       <div class="mt-2 text-sm text-gray-600 dark:text-gray-400">
-        ${it.status==='uploading' ? `Uploading… ${it.progress}%` : it.status.charAt(0).toUpperCase()+it.status.slice(1)}
+        ${it.status==='uploading' ? `Uploadingâ€¦ ${it.progress}%` : it.status.charAt(0).toUpperCase()+it.status.slice(1)}
       </div>
     </div>
   `).join('');
@@ -131,6 +246,9 @@ async function runQueue(){
       form.append('item_id', next.id);
       form.append('session_id', sessionId);
       form.append('last_modified', next.file.lastModified || '');
+      form.append('user_id', next.userId || '');
+      form.append('album_id', next.albumId || '');
+      
       const res = await fetch('/api/upload', { method:'POST', body: form });
       const body = await res.json().catch(()=>({}));
       if(!res.ok && next.status!=='error'){
@@ -169,6 +287,15 @@ const pingStatus = document.getElementById('pingStatus');
 const banner = document.getElementById('topBanner');
 const btnTheme = document.getElementById('btnTheme');
 
+// User/Album controls
+const userSelect = document.getElementById('userSelect');
+const albumSelect = document.getElementById('albumSelect');
+const btnCreateAlbum = document.getElementById('btnCreateAlbum');
+const newAlbumDiv = document.getElementById('newAlbumDiv');
+const newAlbumName = document.getElementById('newAlbumName');
+const btnConfirmAlbum = document.getElementById('btnConfirmAlbum');
+const btnCancelAlbum = document.getElementById('btnCancelAlbum');
+
 // --- Simple banner helper ---
 function showBanner(text, kind='ok'){
   if(!banner) return;
@@ -183,9 +310,59 @@ function showBanner(text, kind='ok'){
   setTimeout(() => banner.classList.add('hidden'), 3000);
 }
 
+// --- Event Handlers ---
+userSelect.onchange = async () => {
+  const userId = userSelect.value;
+  if (userId) {
+    await loadAlbums(userId);
+  } else {
+    albumSelect.innerHTML = '<option value="">Selecione um usuário primeiro</option>';
+  }
+};
+
+btnCreateAlbum.onclick = () => {
+  const userId = userSelect.value;
+  if (!userId) {
+    showBanner('Selecione um usuário primeiro', 'warn');
+    return;
+  }
+  newAlbumDiv.classList.remove('hidden');
+  newAlbumName.focus();
+};
+
+btnConfirmAlbum.onclick = async () => {
+  const userId = userSelect.value;
+  const albumName = newAlbumName.value.trim();
+  
+  if (!albumName) {
+    showBanner('Digite o nome do álbum', 'warn');
+    return;
+  }
+  
+  try {
+    await createAlbum(userId, albumName);
+    newAlbumDiv.classList.add('hidden');
+    newAlbumName.value = '';
+  } catch (error) {
+    // Error already handled in createAlbum
+  }
+};
+
+btnCancelAlbum.onclick = () => {
+  newAlbumDiv.classList.add('hidden');
+  newAlbumName.value = '';
+};
+
+// Allow Enter key to confirm album creation
+newAlbumName.onkeypress = (e) => {
+  if (e.key === 'Enter') {
+    btnConfirmAlbum.click();
+  }
+};
+
 // --- Connection test with ephemeral banner ---
 btnPing.onclick = async () => {
-  pingStatus.textContent = 'checking…';
+  pingStatus.textContent = 'checkingâ€¦';
   try{
     const r = await fetch('/api/ping', { method:'POST' });
     const j = await r.json();
@@ -258,3 +435,8 @@ btnClearAll.onclick = ()=>{ items = []; render(); };
 
 // --- Dark mode toggle ---
 btnTheme.onclick = toggleDarkMode;
+
+// --- Initialize ---
+window.addEventListener('DOMContentLoaded', async () => {
+  await loadUsers();
+});

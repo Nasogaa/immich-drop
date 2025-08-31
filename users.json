@@ -1,0 +1,16 @@
+{
+  "users": [
+    {
+      "id": "bb494186-2061-4d46-be35-8924fc21cf18",
+      "name": "bruno",
+      "email": "brunossf4@gmail.com",
+      "api_key": "x4PhHSnTZguReZimCGzVg3NYwtSYOSNq1OaG34PrEw"
+    },
+    {
+      "id": "4035bf31-c4f3-4b20-9265-3d1dd0a598f2", 
+      "name": "Leticia",
+      "email": "leticiakarinarodrigues@gmail.com",
+      "api_key": "a46tgzvPSzqLFAxJ56ZlR4FMsSO9B9RgTujaSf9M4M"
+    }
+  ]
+}

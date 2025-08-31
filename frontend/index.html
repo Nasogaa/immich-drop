@@ -32,6 +32,38 @@
       </div>
     </header>
 
+    <!-- User and Album Selection -->
+    <section class="rounded-2xl border bg-white p-4 shadow-sm dark:bg-gray-800 dark:border-gray-700 transition-colors">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label for="userSelect" class="block text-sm font-medium mb-2">Usuário:</label>
+          <select id="userSelect" class="w-full px-3 py-2 border rounded-xl bg-white dark:bg-gray-700 dark:border-gray-600 dark:text-gray-100">
+            <option value="">Carregando usuários...</option>
+          </select>
+        </div>
+        <div>
+          <label for="albumSelect" class="block text-sm font-medium mb-2">Álbum:</label>
+          <div class="flex gap-2">
+            <select id="albumSelect" class="flex-1 px-3 py-2 border rounded-xl bg-white dark:bg-gray-700 dark:border-gray-600 dark:text-gray-100">
+              <option value="">Selecione um usuário primeiro</option>
+            </select>
+            <button id="btnCreateAlbum" class="px-3 py-2 bg-blue-500 text-white rounded-xl hover:bg-blue-600 transition-colors text-sm" title="Criar novo álbum">
+              <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                <path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd"/>
+              </svg>
+            </button>
+          </div>
+          <div id="newAlbumDiv" class="hidden mt-2">
+            <input id="newAlbumName" type="text" placeholder="Nome do novo álbum" class="w-full px-3 py-2 border rounded-xl bg-white dark:bg-gray-700 dark:border-gray-600 dark:text-gray-100 text-sm">
+            <div class="flex gap-2 mt-2">
+              <button id="btnConfirmAlbum" class="px-3 py-1 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors text-sm">Criar</button>
+              <button id="btnCancelAlbum" class="px-3 py-1 bg-gray-500 text-white rounded-lg hover:bg-gray-600 transition-colors text-sm">Cancelar</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- Dropzone -->
     <section id="dropzone" class="rounded-2xl border-2 border-dashed p-10 text-center bg-white dark:bg-gray-800 dark:border-gray-600 transition-colors">
       <div class="mx-auto h-12 w-12 opacity-70">
