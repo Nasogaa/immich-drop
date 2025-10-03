@@ -90,7 +90,6 @@ volumes:
   immich_drop_data:
 ```
 
-```
 ### CLI
 ```bash
 docker compose pull
