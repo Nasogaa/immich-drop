@@ -94,6 +94,22 @@ def db_init() -> None:
         );
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS upload_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT,
+            uploadedat TEXT DEFAULT CURRENT_TIMESTAMP,
+            ip TEXT,
+            useragent TEXT,
+            fingerprint TEXT,
+            filename TEXT,
+            size INTEGER,
+            checksum TEXT,
+            immichassetid TEXT
+        );
+        """
+    )
     conn.commit()
     conn.close()
 
