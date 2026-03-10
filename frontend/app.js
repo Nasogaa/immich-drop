@@ -72,7 +72,7 @@ initDarkMode();
       const j = await r.json();
       if (j && typeof j === 'object') {
         CFG.chunked_uploads_enabled = !!j.chunked_uploads_enabled;
-        const n = parseInt(j.chunk_size_mb, 10);
+        const n = parseFloat(j.chunk_size_mb, 10);
         if (!Number.isNaN(n) && n > 0) CFG.chunk_size_mb = n;
       }
     }
@@ -238,7 +238,7 @@ async function uploadWhole(next){
 }
 
 async function uploadChunked(next){
-  const chunkBytes = Math.max(1, CFG.chunk_size_mb|0) * 1024 * 1024;
+  const chunkBytes = Math.max(1024, CFG.chunk_size_mb * 1024 * 1024);
   const total = Math.ceil(next.file.size / chunkBytes) || 1;
   // init
   try {

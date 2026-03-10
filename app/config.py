@@ -23,7 +23,7 @@ class Settings:
     session_secret: str = ""
     log_level: str = "INFO"
     chunked_uploads_enabled: bool = False
-    chunk_size_mb: int = 95
+    chunk_size_mb: float = 95
 
     @property
     def normalized_base_url(self) -> str:
@@ -55,7 +55,7 @@ def load_settings() -> Settings:
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     chunked_uploads_enabled = as_bool(os.getenv("CHUNKED_UPLOADS_ENABLED", "false"), False)
     try:
-        chunk_size_mb = int(os.getenv("CHUNK_SIZE_MB", "95"))
+        chunk_size_mb = float(os.getenv("CHUNK_SIZE_MB", "95"))
     except ValueError:
         chunk_size_mb = 95
     return Settings(
