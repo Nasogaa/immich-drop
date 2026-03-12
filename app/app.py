@@ -60,7 +60,7 @@ FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "fronten
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
 # Chunk upload storage
-CHUNK_ROOT = "/data/chunks"
+CHUNK_ROOT = SETTINGS.chunk_root
 try:
     os.makedirs(CHUNK_ROOT, exist_ok=True)
 except Exception:

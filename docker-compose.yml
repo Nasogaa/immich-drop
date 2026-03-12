@@ -18,6 +18,7 @@ services:
       # Chunked uploads to bypass 100MB limits (e.g., Cloudflare Tunnel)
       CHUNKED_UPLOADS_ENABLED: true
       CHUNK_SIZE_MB: 95
+      CHUNK_ROOT: /data/chunks
 
 
     volumes:

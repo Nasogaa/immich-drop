@@ -24,6 +24,7 @@ class Settings:
     log_level: str = "INFO"
     chunked_uploads_enabled: bool = False
     chunk_size_mb: int = 95
+    chunk_root: str = "/data/chunks"
 
     @property
     def normalized_base_url(self) -> str:
@@ -58,6 +59,7 @@ def load_settings() -> Settings:
         chunk_size_mb = int(os.getenv("CHUNK_SIZE_MB", "95"))
     except ValueError:
         chunk_size_mb = 95
+    chunk_root = os.getenv("CHUNK_ROOT", "/data/chunks")
     return Settings(
         immich_base_url=base,
         immich_api_key=api_key,
@@ -70,4 +72,5 @@ def load_settings() -> Settings:
         log_level=log_level,
         chunked_uploads_enabled=chunked_uploads_enabled,
         chunk_size_mb=chunk_size_mb,
+        chunk_root=chunk_root,
     )

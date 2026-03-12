@@ -141,6 +141,7 @@ Roadmap highlight
 
 - Enable chunked uploads by setting `CHUNKED_UPLOADS_ENABLED=true`.
 - Configure chunk size with `CHUNK_SIZE_MB` (default: `95`). The client only uses chunked mode for files larger than this.
+- Configure chunk temp storage with `CHUNK_ROOT` (default: `/data/chunks`).
 - Intended to bypass upstream limits (e.g., 100MB) while preserving duplicate checks, EXIF timestamps, album add, and per‑item progress via WebSocket.
 
 ---
@@ -236,6 +237,7 @@ LOG_LEVEL=DEBUG
 # Chunked uploads (optional)
 CHUNKED_UPLOADS_ENABLED=true
 CHUNK_SIZE_MB=95
+CHUNK_ROOT=/data/chunks
 
 ```
 
