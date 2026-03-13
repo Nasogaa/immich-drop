@@ -11,11 +11,11 @@ Immich Drop Uploader – Backend (FastAPI, simplified)
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import hashlib
 import os
 import sqlite3
+import tempfile
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -194,11 +194,19 @@ hub = SessionHub()
 
 # ---------- Helpers ----------
 
-def sha1_hex(file_bytes: bytes) -> str:
-    """Return SHA-1 hex digest of file_bytes."""
+def sha1_hex_and_size(file_obj) -> tuple[str, int]:
+    """Return SHA-1 hex digest and size for a file-like object."""
     h = hashlib.sha1()
-    h.update(file_bytes)
-    return h.hexdigest()
+    size = 0
+    file_obj.seek(0)
+    while True:
+        chunk = file_obj.read(1024 * 1024)
+        if not chunk:
+            break
+        h.update(chunk)
+        size += len(chunk)
+    file_obj.seek(0)
+    return h.hexdigest(), size
 
 def sanitize_filename(name: Optional[str]) -> str:
     """Return a minimally sanitized filename that preserves the original name.
@@ -222,14 +230,15 @@ def sanitize_filename(name: Optional[str]) -> str:
     cleaned = ''.join(cleaned_chars).strip()
     return cleaned or "file"
 
-def read_exif_datetimes(file_bytes: bytes):
+def read_exif_datetimes(file_obj):
     """
-    Extract EXIF DateTimeOriginal / ModifyDate values when possible.
+    Extract EXIF DateTimeOriginal / ModifyDate values from a file-like object.
     Returns (created, modified) as datetime or (None, None) on failure.
     """
     created = modified = None
     try:
-        with Image.open(io.BytesIO(file_bytes)) as im:
+        file_obj.seek(0)
+        with Image.open(file_obj) as im:
             exif = getattr(im, "_getexif", lambda: None)() or {}
             if exif:
                 tags = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
@@ -244,6 +253,10 @@ def read_exif_datetimes(file_bytes: bytes):
                     created = parse_dt(dt_original)
                 if isinstance(dt_modified, str):
                     modified = parse_dt(dt_modified)
+    except Exception:
+        pass
+    try:
+        file_obj.seek(0)
     except Exception:
         pass
     return created, modified
@@ -459,28 +472,27 @@ async def ws_endpoint(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         await hub.disconnect(session_id, ws)
 
-@app.post("/api/upload")
-async def api_upload(
+async def _handle_upload_file(
     request: Request,
-    file: UploadFile,
-    item_id: str = Form(...),
-    session_id: str = Form(...),
-    last_modified: Optional[int] = Form(None),
-    invite_token: Optional[str] = Form(None),
-    fingerprint: Optional[str] = Form(None),
-):
-    """Receive a file, check duplicates, forward to Immich; stream progress via WS."""
-    raw = await file.read()
-    size = len(raw)
-    checksum = sha1_hex(raw)
+    file_obj,
+    filename: str,
+    content_type: Optional[str],
+    item_id: str,
+    session_id: str,
+    last_modified: Optional[int],
+    invite_token: Optional[str],
+    fingerprint: Optional[str],
+) -> JSONResponse:
+    """Process an upload from a file-like object and proxy it to Immich."""
+    checksum, size = sha1_hex_and_size(file_obj)
 
-    exif_created, exif_modified = read_exif_datetimes(raw)
+    exif_created, exif_modified = read_exif_datetimes(file_obj)
     created_at = exif_created or (datetime.fromtimestamp(last_modified / 1000) if last_modified else datetime.utcnow())
     modified_at = exif_modified or created_at
     created_iso = created_at.isoformat()
     modified_iso = modified_at.isoformat()
 
-    device_asset_id = f"{file.filename}-{last_modified or 0}-{size}"
+    device_asset_id = f"{filename}-{last_modified or 0}-{size}"
 
     if db_lookup_checksum(checksum):
         await send_progress(session_id, item_id, "duplicate", 100, "Duplicate (by checksum - local cache)")
@@ -493,14 +505,16 @@ async def api_upload(
     bulk = immich_bulk_check([{"id": item_id, "checksum": checksum}])
     if bulk.get(item_id, {}).get("action") == "reject" and bulk[item_id].get("reason") == "duplicate":
         asset_id = bulk[item_id].get("assetId")
-        db_insert_upload(checksum, file.filename, size, device_asset_id, asset_id, created_iso)
+        db_insert_upload(checksum, filename, size, device_asset_id, asset_id, created_iso)
         await send_progress(session_id, item_id, "duplicate", 100, "Duplicate (server)", asset_id)
         return JSONResponse({"status": "duplicate", "id": asset_id}, status_code=200)
 
-    safe_name = sanitize_filename(file.filename)
+    safe_name = sanitize_filename(filename)
+
     def gen_encoder() -> MultipartEncoder:
+        file_obj.seek(0)
         return MultipartEncoder(fields={
-            "assetData": (safe_name, io.BytesIO(raw), file.content_type or "application/octet-stream"),
+            "assetData": (safe_name, file_obj, content_type or "application/octet-stream"),
             "deviceAssetId": device_asset_id,
             "deviceId": f"python-{session_id}",
             "fileCreatedAt": created_iso,
@@ -604,7 +618,7 @@ async def api_upload(
         target_album_id = album_id
         target_album_name = album_name
 
-    async def do_upload():
+    async def do_upload() -> JSONResponse:
         await send_progress(session_id, item_id, "uploading", 0, "Uploading…")
         sent = {"pct": 0}
         def cb(monitor: MultipartEncoderMonitor) -> None:
@@ -620,7 +634,7 @@ async def api_upload(
             if r.status_code in (200, 201):
                 data = r.json()
                 asset_id = data.get("id")
-                db_insert_upload(checksum, file.filename, size, device_asset_id, asset_id, created_iso)
+                db_insert_upload(checksum, filename, size, device_asset_id, asset_id, created_iso)
                 status = data.get("status", "created")
                 
                 # Add to album if configured (invite overrides .env)
@@ -687,7 +701,7 @@ async def api_upload(
                     ua = request.headers.get('user-agent', '') if request else ''
                     curlg.execute(
                         "INSERT INTO upload_events (token, ip, user_agent, fingerprint, filename, size, checksum, immich_asset_id) VALUES (?,?,?,?,?,?,?,?)",
-                        (invite_token or '', ip, ua, fingerprint or '', file.filename, size, checksum, asset_id or None)
+                        (invite_token or '', ip, ua, fingerprint or '', filename, size, checksum, asset_id or None)
                     )
                     connlg.commit()
                     connlg.close()
@@ -706,6 +720,30 @@ async def api_upload(
             return JSONResponse({"error": str(e)}, status_code=500)
 
     return await do_upload()
+
+
+@app.post("/api/upload")
+async def api_upload(
+    request: Request,
+    file: UploadFile,
+    item_id: str = Form(...),
+    session_id: str = Form(...),
+    last_modified: Optional[int] = Form(None),
+    invite_token: Optional[str] = Form(None),
+    fingerprint: Optional[str] = Form(None),
+):
+    """Receive a file, check duplicates, forward to Immich; stream progress via WS."""
+    return await _handle_upload_file(
+        request=request,
+        file_obj=file.file,
+        filename=file.filename,
+        content_type=file.content_type,
+        item_id=item_id,
+        session_id=session_id,
+        last_modified=last_modified,
+        invite_token=invite_token,
+        fingerprint=fingerprint,
+    )
 
 # --------- Chunked upload endpoints ---------
 
@@ -774,9 +812,17 @@ async def api_upload_chunk(
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f)
         # Save chunk
-        content = await chunk.read()
-        with open(os.path.join(d, f"part_{int(chunk_index):06d}"), "wb") as f:
-            f.write(content)
+        part_path = os.path.join(d, f"part_{int(chunk_index):06d}")
+        part_tmp_path = f"{part_path}.tmp"
+        with open(part_tmp_path, "wb") as f:
+            while True:
+                block = await chunk.read(1024 * 1024)
+                if not block:
+                    break
+                f.write(block)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(part_tmp_path, part_path)
     except Exception as e:
         logger.exception("Chunk write failed: %s", e)
         return JSONResponse({"error": "chunk_write_failed"}, status_code=500)
@@ -817,16 +863,25 @@ async def api_upload_chunk_complete(request: Request) -> JSONResponse:
             pass
     if not name:
         name = "upload.bin"
-    # Assemble
-    parts = []
+    for i in range(total_chunks):
+        p = os.path.join(d, f"part_{i:06d}")
+        if not os.path.exists(p):
+            return JSONResponse({"error": "missing_part", "index": i}, status_code=400)
+
+    assembled_path: Optional[str] = None
     try:
-        for i in range(total_chunks):
-            p = os.path.join(d, f"part_{i:06d}")
-            if not os.path.exists(p):
-                return JSONResponse({"error": "missing_part", "index": i}, status_code=400)
-            with open(p, "rb") as f:
-                parts.append(f.read())
-        raw = b"".join(parts)
+        with tempfile.NamedTemporaryFile(prefix="assembled_", suffix=".bin", dir=CHUNK_ROOT, delete=False) as assembled:
+            assembled_path = assembled.name
+            for i in range(total_chunks):
+                p = os.path.join(d, f"part_{i:06d}")
+                with open(p, "rb") as src:
+                    while True:
+                        block = src.read(1024 * 1024)
+                        if not block:
+                            break
+                        assembled.write(block)
+            assembled.flush()
+            os.fsync(assembled.fileno())
     except Exception as e:
         logger.exception("Assemble failed: %s", e)
         return JSONResponse({"error": "assemble_failed"}, status_code=500)
@@ -848,226 +903,25 @@ async def api_upload_chunk_complete(request: Request) -> JSONResponse:
     except Exception:
         pass
 
-    # Now reuse the core logic from api_upload but with assembled bytes
-    item_id_local = item_id
-    session_id_local = session_id
-    file_like_name = name
-    file_size = len(raw)
-    checksum = sha1_hex(raw)
-    exif_created, exif_modified = read_exif_datetimes(raw)
-    created_at = exif_created or (datetime.fromtimestamp(last_modified / 1000) if last_modified else datetime.utcnow())
-    modified_at = exif_modified or created_at
-    created_iso = created_at.isoformat()
-    modified_iso = modified_at.isoformat()
-    device_asset_id = f"{file_like_name}-{last_modified or 0}-{file_size}"
-
-    # Local duplicate checks
-    if db_lookup_checksum(checksum):
-        await send_progress(session_id_local, item_id_local, "duplicate", 100, "Duplicate (by checksum - local cache)")
-        return JSONResponse({"status": "duplicate", "id": None}, status_code=200)
-    if db_lookup_device_asset(device_asset_id):
-        await send_progress(session_id_local, item_id_local, "duplicate", 100, "Already uploaded from this device (local cache)")
-        return JSONResponse({"status": "duplicate", "id": None}, status_code=200)
-
-    await send_progress(session_id_local, item_id_local, "checking", 2, "Checking duplicates…")
-    bulk = immich_bulk_check([{ "id": item_id_local, "checksum": checksum }])
-    if bulk.get(item_id_local, {}).get("action") == "reject" and bulk[item_id_local].get("reason") == "duplicate":
-        asset_id = bulk[item_id_local].get("assetId")
-        db_insert_upload(checksum, file_like_name, file_size, device_asset_id, asset_id, created_iso)
-        await send_progress(session_id_local, item_id_local, "duplicate", 100, "Duplicate (server)", asset_id)
-        return JSONResponse({"status": "duplicate", "id": asset_id}, status_code=200)
-
-    safe_name2 = sanitize_filename(file_like_name)
-    def gen_encoder2() -> MultipartEncoder:
-        return MultipartEncoder(fields={
-            "assetData": (safe_name2, io.BytesIO(raw), content_type or "application/octet-stream"),
-            "deviceAssetId": device_asset_id,
-            "deviceId": f"python-{session_id_local}",
-            "fileCreatedAt": created_iso,
-            "fileModifiedAt": modified_iso,
-            "isFavorite": "false",
-            "filename": safe_name2,
-            "originalFileName": safe_name2,
-        })
-
-    # Invite validation/gating mirrors api_upload
-    target_album_id: Optional[str] = None
-    target_album_name: Optional[str] = None
-    if invite_token:
-        try:
-            conn = sqlite3.connect(SETTINGS.state_db)
-            cur = conn.cursor()
-            cur.execute("SELECT token, album_id, album_name, max_uses, used_count, expires_at, COALESCE(claimed,0), claimed_by_session, password_hash, COALESCE(disabled,0) FROM invites WHERE token = ?", (invite_token,))
-            row = cur.fetchone()
-            conn.close()
-        except Exception as e:
-            logger.exception("Invite lookup error: %s", e)
-            row = None
-        if not row:
-            await send_progress(session_id_local, item_id_local, "error", 100, "Invalid invite token")
-            return JSONResponse({"error": "invalid_invite"}, status_code=403)
-        _, album_id, album_name, max_uses, used_count, expires_at, claimed, claimed_by_session, password_hash, disabled = row
-        # Admin deactivation check
-        try:
-            if int(disabled) == 1:
-                await send_progress(session_id_local, item_id_local, "error", 100, "Invite disabled")
-                return JSONResponse({"error": "invite_disabled"}, status_code=403)
-        except Exception:
-            pass
-        if password_hash:
-            try:
-                ia = request.session.get("inviteAuth") or {}
-                if not ia.get(invite_token):
-                    await send_progress(session_id_local, item_id_local, "error", 100, "Password required")
-                    return JSONResponse({"error": "invite_password_required"}, status_code=403)
-            except Exception:
-                await send_progress(session_id_local, item_id_local, "error", 100, "Password required")
-                return JSONResponse({"error": "invite_password_required"}, status_code=403)
-        # expiry
-        if expires_at:
-            try:
-                if datetime.utcnow() > datetime.fromisoformat(expires_at):
-                    await send_progress(session_id_local, item_id_local, "error", 100, "Invite expired")
-                    return JSONResponse({"error": "invite_expired"}, status_code=403)
-            except Exception:
-                pass
-        try:
-            max_uses_int = int(max_uses) if max_uses is not None else -1
-        except Exception:
-            max_uses_int = -1
-        if max_uses_int == 1:
-            if claimed:
-                if claimed_by_session and claimed_by_session != session_id_local:
-                    await send_progress(session_id_local, item_id_local, "error", 100, "Invite already used")
-                    return JSONResponse({"error": "invite_claimed"}, status_code=403)
-            else:
-                try:
-                    connc = sqlite3.connect(SETTINGS.state_db)
-                    curc = connc.cursor()
-                    curc.execute(
-                        "UPDATE invites SET claimed = 1, claimed_at = CURRENT_TIMESTAMP, claimed_by_session = ? WHERE token = ? AND (claimed IS NULL OR claimed = 0)",
-                        (session_id_local, invite_token)
-                    )
-                    connc.commit()
-                    changed = connc.total_changes
-                    connc.close()
-                except Exception as e:
-                    logger.exception("Invite claim failed: %s", e)
-                    return JSONResponse({"error": "invite_claim_failed"}, status_code=500)
-                if changed == 0:
-                    try:
-                        conn2 = sqlite3.connect(SETTINGS.state_db)
-                        cur2 = conn2.cursor()
-                        cur2.execute("SELECT claimed_by_session FROM invites WHERE token = ?", (invite_token,))
-                        owner_row = cur2.fetchone()
-                        conn2.close()
-                        owner = owner_row[0] if owner_row else None
-                    except Exception:
-                        owner = None
-                    if not owner or owner != session_id_local:
-                        await send_progress(session_id_local, item_id_local, "error", 100, "Invite already used")
-                        return JSONResponse({"error": "invite_claimed"}, status_code=403)
-        else:
-            if (used_count or 0) >= (max_uses_int if max_uses_int >= 0 else 10**9):
-                await send_progress(session_id_local, item_id_local, "error", 100, "Invite already used up")
-                return JSONResponse({"error": "invite_exhausted"}, status_code=403)
-        target_album_id = album_id
-        target_album_name = album_name
-
-    await send_progress(session_id_local, item_id_local, "uploading", 0, "Uploading…")
-    sent = {"pct": 0}
-    def cb2(monitor: MultipartEncoderMonitor) -> None:
-        if monitor.len:
-            pct = int(monitor.bytes_read * 100 / monitor.len)
-            if pct != sent["pct"]:
-                sent["pct"] = pct
-                asyncio.create_task(send_progress(session_id_local, item_id_local, "uploading", pct))
-    encoder2 = gen_encoder2()
-    monitor2 = MultipartEncoderMonitor(encoder2, cb2)
-    headers = {"Accept": "application/json", "Content-Type": monitor2.content_type, "x-immich-checksum": checksum, **immich_headers(request)}
     try:
-        r = requests.post(f"{SETTINGS.normalized_base_url}/assets", headers=headers, data=monitor2, timeout=120)
-        if r.status_code in (200, 201):
-            data_r = r.json()
-            asset_id = data_r.get("id")
-            db_insert_upload(checksum, file_like_name, file_size, device_asset_id, asset_id, created_iso)
-            status = data_r.get("status", "created")
-            if asset_id:
-                added = False
-                if invite_token:
-                    # Only add if invite specified an album; do not fallback to env default
-                    if target_album_id or target_album_name:
-                        added = add_asset_to_album(asset_id, request=request, album_id_override=target_album_id, album_name_override=target_album_name)
-                        if added:
-                            status += f" (added to album '{target_album_name or target_album_id}')"
-                elif SETTINGS.album_name:
-                    if add_asset_to_album(asset_id, request=request):
-                        status += f" (added to album '{SETTINGS.album_name}')"
-            await send_progress(session_id_local, item_id_local, "duplicate" if status == "duplicate" else "done", 100, status, asset_id)
-            if invite_token:
-                try:
-                    conn2 = sqlite3.connect(SETTINGS.state_db)
-                    cur2 = conn2.cursor()
-                    cur2.execute("SELECT max_uses FROM invites WHERE token = ?", (invite_token,))
-                    row_mu = cur2.fetchone()
-                    mx = None
-                    try:
-                        mx = int(row_mu[0]) if row_mu and row_mu[0] is not None else None
-                    except Exception:
-                        mx = None
-                    if mx == 1:
-                        cur2.execute("UPDATE invites SET used_count = 1 WHERE token = ?", (invite_token,))
-                    else:
-                        cur2.execute("UPDATE invites SET used_count = used_count + 1 WHERE token = ?", (invite_token,))
-                    conn2.commit()
-                    conn2.close()
-                except Exception as e:
-                    logger.exception("Failed to increment invite usage: %s", e)
-            # Log uploader identity and file metadata
+        with open(assembled_path, "rb") as assembled_file:
+            return await _handle_upload_file(
+                request=request,
+                file_obj=assembled_file,
+                filename=name,
+                content_type=content_type,
+                item_id=item_id,
+                session_id=session_id,
+                last_modified=last_modified,
+                invite_token=invite_token,
+                fingerprint=fingerprint,
+            )
+    finally:
+        if assembled_path:
             try:
-                connlg = sqlite3.connect(SETTINGS.state_db)
-                curlg = connlg.cursor()
-                curlg.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS upload_events (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        token TEXT,
-                        uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                        ip TEXT,
-                        user_agent TEXT,
-                        fingerprint TEXT,
-                        filename TEXT,
-                        size INTEGER,
-                        checksum TEXT,
-                        immich_asset_id TEXT
-                    );
-                    """
-                )
-                ip = None
-                try:
-                    ip = (request.client.host if request and request.client else None) or request.headers.get('x-forwarded-for')
-                except Exception:
-                    ip = None
-                ua = request.headers.get('user-agent', '') if request else ''
-                curlg.execute(
-                    "INSERT INTO upload_events (token, ip, user_agent, fingerprint, filename, size, checksum, immich_asset_id) VALUES (?,?,?,?,?,?,?,?)",
-                    (invite_token or '', ip, ua, fingerprint or '', file_like_name, file_size, checksum, asset_id or None)
-                )
-                connlg.commit()
-                connlg.close()
+                os.remove(assembled_path)
             except Exception:
                 pass
-            return JSONResponse({"id": asset_id, "status": status}, status_code=200)
-        else:
-            try:
-                msg = r.json().get("message", r.text)
-            except Exception:
-                msg = r.text
-            await send_progress(session_id_local, item_id_local, "error", 100, msg)
-            return JSONResponse({"error": msg}, status_code=400)
-    except Exception as e:
-        await send_progress(session_id_local, item_id_local, "error", 100, str(e))
-        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.post("/api/album/reset")
 async def api_album_reset() -> dict:
