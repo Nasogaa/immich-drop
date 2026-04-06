@@ -13,4 +13,5 @@ if __name__ == "__main__":
         pass
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8080"))
-    uvicorn.run("app.app:app", host=host, port=port, reload=True)
+    trusted_proxy = os.getenv("TRUSTED_PROXY", None)
+    uvicorn.run("app.app:app", host=host, port=port, reload=True, proxy_headers=True, forwarded_allow_ips=trusted_proxy)
