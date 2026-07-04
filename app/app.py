@@ -477,8 +477,8 @@ async def api_upload(
     exif_created, exif_modified = read_exif_datetimes(raw)
     created_at = exif_created or (datetime.fromtimestamp(last_modified / 1000) if last_modified else datetime.utcnow())
     modified_at = exif_modified or created_at
-    created_iso = created_at.isoformat()
-    modified_iso = modified_at.isoformat()
+    created_iso = created_at.isoformat() if created_at.tzinfo else f"{created_at.isoformat()}Z"
+    modified_iso = modified_at.isoformat() if modified_at.tzinfo else f"{modified_at.isoformat()}Z"
 
     device_asset_id = f"{file.filename}-{last_modified or 0}-{size}"
 
@@ -857,8 +857,8 @@ async def api_upload_chunk_complete(request: Request) -> JSONResponse:
     exif_created, exif_modified = read_exif_datetimes(raw)
     created_at = exif_created or (datetime.fromtimestamp(last_modified / 1000) if last_modified else datetime.utcnow())
     modified_at = exif_modified or created_at
-    created_iso = created_at.isoformat()
-    modified_iso = modified_at.isoformat()
+    created_iso = created_at.isoformat() if created_at.tzinfo else f"{created_at.isoformat()}Z"
+    modified_iso = modified_at.isoformat() if modified_at.tzinfo else f"{modified_at.isoformat()}Z"
     device_asset_id = f"{file_like_name}-{last_modified or 0}-{file_size}"
 
     # Local duplicate checks
