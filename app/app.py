@@ -459,6 +459,124 @@ async def ws_endpoint(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         await hub.disconnect(session_id, ws)
 
+# ---------- Invite preflight gating ----------
+#
+# Public-deployment hardening: when PUBLIC_UPLOAD_PAGE_ENABLED is false the upload
+# API must reject requests that lack a valid, active invite *before* any file body
+# is read into memory or written/assembled on disk. The preflight is deliberately
+# read-only: it must NOT claim an invite or increment usage — those semantics stay
+# in the real upload path so behaviour is unchanged for authorised requests.
+
+# Map preflight error codes to (HTTP status, human message for progress stream).
+_INVITE_PREFLIGHT_ERRORS = {
+    "invite_required": (403, "Invite required"),
+    "invalid_invite": (403, "Invalid invite token"),
+    "invite_disabled": (403, "Invite disabled"),
+    "invite_password_required": (403, "Password required"),
+    "invite_expired": (403, "Invite expired"),
+    "invite_token_conflict": (400, "Conflicting invite tokens"),
+}
+
+
+def resolve_invite_token(request: Request, body_token: Optional[str]):
+    """Establish one unambiguous invite-token source (the request body).
+
+    The frontend always sends the token in the request body (multipart form field
+    or JSON field). To keep a single source of truth, if a token is *also* supplied
+    in the query string and disagrees with the body token we reject the request
+    rather than silently pick one.
+
+    Returns ``(token, error_code)`` where ``error_code`` is ``None`` when OK.
+    """
+    body = (body_token or "").strip() or None
+    try:
+        query = (request.query_params.get("invite_token") or "").strip() or None
+    except Exception:
+        query = None
+    if body and query and body != query:
+        return None, "invite_token_conflict"
+    return (body or query), None
+
+
+def invite_preflight(request: Request, invite_token: Optional[str]):
+    """Decide whether an upload may proceed, without mutating invite state.
+
+    Returns ``(token, error_code)``. ``error_code`` is ``None`` when the request
+    may continue; otherwise it is a key of ``_INVITE_PREFLIGHT_ERRORS``.
+
+    Rules:
+      * If PUBLIC_UPLOAD_PAGE_ENABLED is true, a missing token is allowed
+        (tokenless public upload); a supplied token is still validated.
+      * If PUBLIC_UPLOAD_PAGE_ENABLED is false, a valid active token is required.
+      * A supplied token is validated for existence, admin-disabled, password
+        authorisation and expiry. Claim/usage-exhaustion checks are intentionally
+        left to the real upload path.
+    """
+    token, conflict = resolve_invite_token(request, invite_token)
+    if conflict:
+        return None, conflict
+
+    if not token:
+        if SETTINGS.public_upload_page_enabled:
+            return None, None
+        return None, "invite_required"
+
+    try:
+        conn = sqlite3.connect(SETTINGS.state_db)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT password_hash, expires_at, COALESCE(disabled,0) FROM invites WHERE token = ?",
+            (token,),
+        )
+        row = cur.fetchone()
+        conn.close()
+    except Exception as e:
+        logger.exception("Invite preflight lookup error: %s", e)
+        row = None
+    if not row:
+        return None, "invalid_invite"
+    password_hash, expires_at, disabled = row
+    try:
+        if int(disabled) == 1:
+            return token, "invite_disabled"
+    except Exception:
+        pass
+    if password_hash:
+        try:
+            ia = request.session.get("inviteAuth") or {}
+            if not ia.get(token):
+                return token, "invite_password_required"
+        except Exception:
+            return token, "invite_password_required"
+    if expires_at:
+        try:
+            if datetime.utcnow() > datetime.fromisoformat(expires_at):
+                return token, "invite_expired"
+        except Exception:
+            pass
+    return token, None
+
+
+async def _preflight_or_reject(request: Request, invite_token: Optional[str],
+                               session_id: Optional[str] = None,
+                               item_id: Optional[str] = None):
+    """Run :func:`invite_preflight`; return a JSONResponse to send on rejection.
+
+    Returns ``(token, response)``. When ``response`` is not None the caller must
+    return it immediately (before reading/writing any file data).
+    """
+    token, err = invite_preflight(request, invite_token)
+    if err is None:
+        return token, None
+    status_code, message = _INVITE_PREFLIGHT_ERRORS.get(err, (403, "Forbidden"))
+    if session_id and item_id:
+        try:
+            await send_progress(session_id, item_id, "error", 100, message)
+        except Exception:
+            pass
+    return token, JSONResponse({"error": err}, status_code=status_code)
+
+
 @app.post("/api/upload")
 async def api_upload(
     request: Request,
@@ -470,6 +588,11 @@ async def api_upload(
     fingerprint: Optional[str] = Form(None),
 ):
     """Receive a file, check duplicates, forward to Immich; stream progress via WS."""
+    # Gate BEFORE reading the uploaded file into memory (public-deployment hardening).
+    invite_token, rejection = await _preflight_or_reject(request, invite_token, session_id, item_id)
+    if rejection is not None:
+        return rejection
+
     raw = await file.read()
     size = len(raw)
     checksum = sha1_hex(raw)
@@ -725,6 +848,11 @@ async def api_upload_chunk_init(request: Request) -> JSONResponse:
     session_id = (data or {}).get("session_id")
     if not item_id or not session_id:
         return JSONResponse({"error": "missing_ids"}, status_code=400)
+    # Gate BEFORE creating any chunk directory / manifest on disk.
+    invite_token, rejection = await _preflight_or_reject(
+        request, (data or {}).get("invite_token"), session_id, item_id)
+    if rejection is not None:
+        return rejection
     d = _chunk_dir(session_id, item_id)
     try:
         os.makedirs(d, exist_ok=True)
@@ -733,7 +861,7 @@ async def api_upload_chunk_init(request: Request) -> JSONResponse:
             "name": (data or {}).get("name"),
             "size": (data or {}).get("size"),
             "last_modified": (data or {}).get("last_modified"),
-            "invite_token": (data or {}).get("invite_token"),
+            "invite_token": invite_token,
             "content_type": (data or {}).get("content_type") or "application/octet-stream",
             "created_at": datetime.utcnow().isoformat(),
         }
@@ -755,6 +883,10 @@ async def api_upload_chunk(
     chunk: UploadFile = Form(...),
 ) -> JSONResponse:
     """Receive a single chunk; write to disk under chunk directory."""
+    # Gate BEFORE reading the chunk body or writing anything to disk.
+    invite_token, rejection = await _preflight_or_reject(request, invite_token, session_id, item_id)
+    if rejection is not None:
+        return rejection
     d = _chunk_dir(session_id, item_id)
     try:
         os.makedirs(d, exist_ok=True)
@@ -798,6 +930,10 @@ async def api_upload_chunk_complete(request: Request) -> JSONResponse:
     content_type = (data or {}).get("content_type") or "application/octet-stream"
     if not item_id or not session_id:
         return JSONResponse({"error": "missing_ids"}, status_code=400)
+    # Gate BEFORE reading meta / assembling any chunk data from disk.
+    invite_token, rejection = await _preflight_or_reject(request, invite_token, session_id, item_id)
+    if rejection is not None:
+        return rejection
     d = _chunk_dir(session_id, item_id)
     meta_path = os.path.join(d, "meta.json")
     # Basic validation
